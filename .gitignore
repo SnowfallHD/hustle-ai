@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+env/
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# WebDriver binaries
+chromedriver.exe
+geckodriver.exe
+
+# Output folders
+generated/
+memory/outputs.json
