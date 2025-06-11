@@ -95,7 +95,6 @@ def auto_login(driver):
             f.write(driver.page_source)
         raise RuntimeError(f"Login flow failed: {e}")
 
-
 def scrape_digistore_offers():
     driver = start_driver()
 
@@ -106,33 +105,61 @@ def scrape_digistore_offers():
 
     try:
         WebDriverWait(driver, 35).until(
-            EC.presence_of_all_elements_located((By.CLASS_NAME, "product-box"))
+            EC.presence_of_all_elements_located((By.CLASS_NAME, "product-list-item-container"))
         )
     except Exception as e:
         driver.save_screenshot("debug_login_failed.png")
         raise RuntimeError("Failed to load offers — likely not logged in.") from e
 
-    offer_cards = driver.find_elements(By.CLASS_NAME, "product-box")
+    offer_cards = driver.find_elements(By.CLASS_NAME, "product-list-item-container")
     print(f"[DEBUG] Found {len(offer_cards)} Digistore24 offers")
 
     offers = []
-    for card in offer_cards[:5]:
+    for card in offer_cards[:5]:  # Limit for speed
         try:
-            name = card.find_element(By.CLASS_NAME, "product-title").text
-            earnings = card.find_element(By.CLASS_NAME, "earnings-per-sale").text
-            url = card.find_element(By.TAG_NAME, "a").get_attribute("href")
+            # Expand the card to reveal details
+            try:
+                expand_btn = card.find_element(By.CLASS_NAME, "ng-trigger-expandableBullet")
+                driver.execute_script("arguments[0].click();", expand_btn)
+                time.sleep(0.5)
+            except:
+                pass  # already expanded or button not found
+
+            name = card.find_element(By.TAG_NAME, "h2").text.strip()
+
+            earnings_text = card.find_element(By.XPATH, ".//div[contains(text(), 'Net earnings/sale')]/preceding-sibling::div").text.strip()
+            price = card.find_element(By.XPATH, ".//div[contains(text(), 'Price')]/following-sibling::div").text.strip()
+            commission = card.find_element(By.XPATH, ".//div[contains(text(), 'Commission')]/following-sibling::div").text.strip()
+            cart_conversion = card.find_element(By.XPATH, ".//div[contains(text(), 'Cart conversion')]/following-sibling::div").text.strip()
+            cancel_rate = card.find_element(By.XPATH, ".//div[contains(text(), 'Cancellation rate')]/following-sibling::div").text.strip()
+            vendor = card.find_element(By.XPATH, ".//div[contains(text(), 'Vendor')]/following-sibling::div").text.strip()
+
+            # Get Sales Page URL
+            url = ""
+            for link in card.find_elements(By.TAG_NAME, "a"):
+                if "Sales page" in link.text:
+                    url = link.get_attribute("href")
+                    break
 
             offers.append({
                 "name": name,
-                "description": f"Earnings per sale: {earnings}",
+                "price": price,
+                "commission": commission,
+                "earnings_per_sale": earnings_text,
+                "cart_conversion": cart_conversion,
+                "cancellation_rate": cancel_rate,
+                "vendor": vendor,
                 "url": url
             })
+
         except Exception as e:
-            print(f"[WARN] Skipped a card: {e}")
+            print(f"[WARN] Skipped a card due to parsing error: {e}")
 
     if not IS_DEV:
         driver.quit()
 
+    print("[INFO] Scraped offers:")
+    print(json.dumps(offers, indent=2))
     return offers
 
 def enrich_with_ai(offers):
@@ -153,12 +180,30 @@ def enrich_with_ai(offers):
         - Expected ROI (Low/Med/High)"""
 
         response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "system", "content": prompt}]
+            model="gpt-4-1106-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a business and product analysis expert. Always respond with valid JSON."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7
         )
 
-        enriched_offer = response.choices[0].message.content
-        enriched.append(json.loads(enriched_offer))
+        enriched_offer = response.choices[0].message.content.strip()
+
+        if not enriched_offer:
+            print("[WARN] Empty OpenAI response. Skipping.")
+            continue
+
+        try:
+            enriched.append(json.loads(enriched_offer))
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Failed to parse AI response:\n{enriched_offer}\n{e}")
 
     return enriched
 

@@ -1,16 +1,28 @@
 import json
 import re
+import os
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def load_ideas():
-    with open("memory/ideas.json", "r") as f:
+    with open("memory/ideas.json", "r", encoding="utf-8") as f:
         lines = f.readlines()
-        if not lines:
-            raise ValueError("No ideas found. Run researcher.py first.")
-        ideas = [json.loads(line.strip()) for line in lines]
-    return ideas[-1]
+
+    ideas = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ideas.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            print(f"[WARN] Skipping bad idea line:\n{line}\n{e}")
+
+    return ideas
 
 def extract_json_from_response(text):
     match = re.search(r"\{[\s\S]+\}", text)
@@ -24,25 +36,30 @@ def extract_json_from_response(text):
 
 def build_assets(idea):
     prompt = f"""
-You are the Builder Agent for HustleAI. Here's an idea you received:
+            You are the Builder Agent for HustleAI. Here's an idea you received:
 
-Offer Name: {idea.get('name', 'N/A')}
-Hook: {idea.get('hook', 'N/A')}
-Platform: {idea.get('platform', 'N/A')}
-Content Type: {idea.get('content', 'N/A')}
+            Offer Name: {idea.get('name', 'N/A')}
+            Hook: {idea.get('hook', 'N/A')}
+            Platform: {idea.get('platform', 'N/A')}
+            Content Type: {idea.get('content', 'N/A')}
 
-Create the following in raw JSON:
-1. landing_page: {{headline, benefits (list), CTA}}
-2. ad_hooks: list of short-form ad scripts
-3. sales_email: one-paragraph sales email (as a string)
+            Create the following in raw JSON:
+            1. landing_page: {{headline, benefits (list), CTA}}
+            2. ad_hooks: list of short-form ad scripts
+            3. sales_email: one-paragraph sales email (as a string)
 
-Return ONLY the JSON object. Do not explain anything else.
-"""
+            Return ONLY the JSON object. Do not explain anything else.
+            """
 
     response = client.chat.completions.create(
-        model="gpt-4-1106-preview",  # more consistent output
-        messages=[{"role": "user", "content": prompt}]
+        model="gpt-4-1106-preview",
+        messages=[
+            {"role": "system", "content": "You are an AI monetization expert."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
     )
+
 
     print("[DEBUG] Raw GPT output:")
     print(response.choices[0].message.content)
