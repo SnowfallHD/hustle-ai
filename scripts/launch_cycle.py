@@ -1,6 +1,9 @@
 import subprocess
 import sys
 import time
+import os
+
+print("[DEBUG] DEV_MODE =", os.getenv("DEV_MODE"))
 
 def run_agent(script_path, label):
     print(f"\n[+] Running {label}...")

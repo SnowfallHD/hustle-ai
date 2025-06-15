@@ -1,6 +1,8 @@
 import json
 import time
 import os
+import re
+import unicodedata
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service
@@ -10,12 +12,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.firefox import GeckoDriverManager
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.keys import Keys
+from dom_utils import safe_click, safe_find, safe_text
 from selenium.webdriver.support import expected_conditions as EC
 from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
 IS_DEV = os.getenv("DEV_MODE") == "1"
+print(f"[DEBUG] IS_DEV = {IS_DEV} (DEV_MODE={os.getenv('DEV_MODE')})")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Firefox profile
@@ -29,6 +33,49 @@ def start_driver():
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
+def clean_title(raw_title):
+    prompt = f"""
+    You are a product formatter. Clean up the following product name by removing marketing phrases, symbols like ™ or ®, and anything unnecessary. Return only the cleaned product title, nothing else.
+
+    Product name: "{raw_title}"
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4-1106-preview",
+            messages=[
+                {"role": "system", "content": "You are a product formatting expert."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[ERROR] Failed to clean title with GPT: {e}")
+        return raw_title
+    
+def clean_description(raw: str) -> str:
+    if not raw:
+        return ""
+
+    # Normalize weird Unicode (e.g., smart quotes, non-breaking spaces)
+    text = unicodedata.normalize("NFKD", raw)
+
+    # Remove links (http/https and bare URLs)
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'www\.\S+', '', text)
+
+    # Remove email addresses
+    text = re.sub(r'\S+@\S+', '', text)
+
+    # Collapse excess whitespace
+    text = re.sub(r'\s+', ' ', text)
+
+    # Remove lingering unicode codes like \u00a0 if they slipped through
+    text = text.encode('ascii', 'ignore').decode()
+
+    # Trim
+    return text.strip()
 
 def handle_cookie_consent(driver):
     try:
@@ -36,7 +83,7 @@ def handle_cookie_consent(driver):
             EC.presence_of_element_located((By.ID, "CybotCookiebotDialogBodyButtons"))
         )
         allow_all_btn = driver.find_element(By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll")
-        allow_all_btn.click()
+        safe_click(driver, allow_all_btn)
         print("[INFO] Clicked 'Allow All' on Cookiebot.")
         time.sleep(1)
     except TimeoutException:
@@ -45,6 +92,7 @@ def handle_cookie_consent(driver):
         print(f"[WARN] Failed to handle Cookiebot: {e}")
 
 def auto_login(driver):
+    print("[DEBUG] Entered auto_login")
     email = os.getenv("DIGISTORE_EMAIL")
     password = os.getenv("DIGISTORE_PASSWORD")
     if not email or not password:
@@ -74,13 +122,12 @@ def auto_login(driver):
         email_input = driver.find_element(By.NAME, "login_username")
         password_input = driver.find_element(By.NAME, "login_password")
         login_button = driver.find_element(By.NAME, "login_login")
-
         email_input.clear()
         email_input.send_keys(email)
         password_input.clear()
         password_input.send_keys(password)
 
-        login_button.click()
+        safe_click(driver, login_button)
         print("[INFO] Login form submitted.")
         time.sleep(5)
 
@@ -96,75 +143,109 @@ def auto_login(driver):
         raise RuntimeError(f"Login flow failed: {e}")
 
 def scrape_digistore_offers():
+    print("[DEBUG] Starting scrape_digistore_offers()")
+    print(f"[DEBUG] IS_DEV = {IS_DEV} (type: {type(IS_DEV)})")
+    
     driver = start_driver()
-
-    auto_login(driver)
-
-    driver.get("https://www.digistore24-app.com/app/en/vendor/account/marketplace/all")
-    time.sleep(3)
+    print("[DEBUG] Driver started")
 
     try:
-        WebDriverWait(driver, 35).until(
-            EC.presence_of_all_elements_located((By.CLASS_NAME, "product-list-item-container"))
-        )
-    except Exception as e:
-        driver.save_screenshot("debug_login_failed.png")
-        raise RuntimeError("Failed to load offers — likely not logged in.") from e
+        auto_login(driver)
+        print("[DEBUG] Auto-login complete")
 
-    offer_cards = driver.find_elements(By.CLASS_NAME, "product-list-item-container")
-    print(f"[DEBUG] Found {len(offer_cards)} Digistore24 offers")
+        driver.get("https://www.digistore24-app.com/app/en/vendor/account/marketplace/all")
+        print("[DEBUG] Navigated to Digistore24 marketplace")
 
-    offers = []
-    for card in offer_cards[:5]:  # Limit for speed
+        time.sleep(3)
+
         try:
-            # Expand the card to reveal details
+            WebDriverWait(driver, 35).until(
+                EC.presence_of_all_elements_located((By.CLASS_NAME, "product-list-item-container"))
+            )
+            print("[DEBUG] Offer cards loaded")
+        except Exception as e:
+            driver.save_screenshot("debug_login_failed.png")
+            print(f"[ERROR] Failed to load offers: {e}")
+            raise RuntimeError("Failed to load offers — likely not logged in.") from e
+
+        offer_cards = driver.find_elements(By.CLASS_NAME, "product-list-item-container")
+        print(f"[DEBUG] Found {len(offer_cards)} Digistore24 offers")
+
+        offers = []
+        parsed = 0
+        for idx, card in enumerate(offer_cards):
+            print(f"[DEBUG] Parsing offer card {idx + 1}")
+            expand_btn = safe_find(card, By.CSS_SELECTOR, ".arrow-down-icon.cursor-pointer", timeout=2)
+            if not expand_btn:
+                print(f"[DEBUG] Skipping card {idx + 1} — no expand button")
+                continue
+
             try:
-                expand_btn = card.find_element(By.CLASS_NAME, "ng-trigger-expandableBullet")
-                driver.execute_script("arguments[0].click();", expand_btn)
+                safe_click(driver, expand_btn)
                 time.sleep(0.5)
-            except:
-                pass  # already expanded or button not found
 
-            name = card.find_element(By.TAG_NAME, "h2").text.strip()
+                raw_name = safe_text(card, By.TAG_NAME, "h2")
+                print(f"[DEBUG] Raw name: {raw_name}")
+                name = clean_title(raw_name)
+                print(f"[DEBUG] Cleaned name: {name}")
 
-            earnings_text = card.find_element(By.XPATH, ".//div[contains(text(), 'Net earnings/sale')]/preceding-sibling::div").text.strip()
-            price = card.find_element(By.XPATH, ".//div[contains(text(), 'Price')]/following-sibling::div").text.strip()
-            commission = card.find_element(By.XPATH, ".//div[contains(text(), 'Commission')]/following-sibling::div").text.strip()
-            cart_conversion = card.find_element(By.XPATH, ".//div[contains(text(), 'Cart conversion')]/following-sibling::div").text.strip()
-            cancel_rate = card.find_element(By.XPATH, ".//div[contains(text(), 'Cancellation rate')]/following-sibling::div").text.strip()
-            vendor = card.find_element(By.XPATH, ".//div[contains(text(), 'Vendor')]/following-sibling::div").text.strip()
+                earnings_text = safe_text(card, By.XPATH, ".//div[contains(text(), 'Earnings/cart visitor')]/following-sibling::div[1]")
+                price = safe_text(card, By.XPATH, ".//div[contains(text(), 'Price')]/following-sibling::div[1]")
+                commission = safe_text(card, By.XPATH, ".//div[contains(text(), 'Commission')]/following-sibling::div[1]")
+                cart_conversion = safe_text(card, By.XPATH, ".//div[contains(text(), 'Cart conversion')]/following-sibling::div[1]")
+                cancel_rate = safe_text(card, By.XPATH, ".//div[contains(text(), 'Cancellation rate')]/following-sibling::div[1]")
+                vendor = safe_text(card, By.XPATH, ".//div[contains(text(), 'Vendor')]/following-sibling::div[1]")
+                # Pull full description block
+                try:
+                    raw_description = safe_text(card, By.XPATH, ".//div[contains(@class, 'description')]")
+                    description = clean_description(raw_description)
+                except Exception:
+                    description = "No description available"
 
-            # Get Sales Page URL
-            url = ""
-            for link in card.find_elements(By.TAG_NAME, "a"):
-                if "Sales page" in link.text:
-                    url = link.get_attribute("href")
+                url = ""
+                for link in card.find_elements(By.TAG_NAME, "a"):
+                    if "Sales page" in link.text:
+                        url = link.get_attribute("href")
+                        break
+
+                offers.append({
+                    "name": name,
+                    "raw_name": raw_name,
+                    "price": price,
+                    "commission": commission,
+                    "earnings_per_cart_visitor": earnings_text,
+                    "cart_conversion": cart_conversion,
+                    "cancellation_rate": cancel_rate,
+                    "vendor": vendor,
+                    "url": url,
+                    "description": description
+                })
+
+                parsed += 1
+                print(f"[DEBUG] Parsed card {idx + 1}")
+                if parsed >= 10:
+                    print("[DEBUG] Reached max parse limit (10)")
                     break
 
-            offers.append({
-                "name": name,
-                "price": price,
-                "commission": commission,
-                "earnings_per_sale": earnings_text,
-                "cart_conversion": cart_conversion,
-                "cancellation_rate": cancel_rate,
-                "vendor": vendor,
-                "url": url
-            })
+            except Exception as e:
+                print(f"[WARN] Failed to parse expanded card {idx + 1}: {e}")
 
-        except Exception as e:
-            print(f"[WARN] Skipped a card due to parsing error: {e}")
+    finally:
+        print("[DEBUG] Entering finally block...")
+        if not IS_DEV:
+            print("[DEBUG] Quitting driver...")
+            try:
+                driver.quit()
+                print("[DEBUG] Driver quit successfully")
+            except Exception as quit_err:
+                print(f"[ERROR] Failed to quit driver: {quit_err}")
+        else:
+            print("[DEBUG] Skipping driver.quit() because IS_DEV is True")
 
-    if not IS_DEV:
-        driver.quit()
-
-    print("[INFO] Scraped offers:")
-    print(json.dumps(offers, indent=2))
+    print("[DEBUG] Returning offers")
     return offers
 
 def enrich_with_ai(offers):
-    print("[INFO] Scraped offers:")
-    print(json.dumps(offers, indent=2))
     enriched = []
     for offer in offers:
         prompt = f"""You are an AI monetization expert. Analyze the following affiliate offer:
@@ -209,13 +290,15 @@ def enrich_with_ai(offers):
 
 
 def run_research():
+    print("[DEBUG] Entering run_research()")
     offers = scrape_digistore_offers()
+    print("[DEBUG] scrape_digistore_offers() finished")
 
     if IS_DEV:
-        print("[INFO] Running in DEV mode — skipping AI enrichment.")
-        print(json.dumps(offers, indent=2))
+        print("[DEBUG] IS_DEV is True — skipping enrichment")
         return offers
 
+    print("[DEBUG] Enriching offers with OpenAI")
     enriched = enrich_with_ai(offers)
     os.makedirs("memory", exist_ok=True)
     with open("memory/ideas.json", "a") as f:
