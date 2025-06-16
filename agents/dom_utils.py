@@ -4,11 +4,13 @@ from selenium.common.exceptions import NoSuchElementException, ElementClickInter
 
 def safe_click(driver, element, retries=3, delay=0.5):
     """
-    Safely attempts to click a Selenium element using JavaScript execution.
+    Safely scrolls into view and attempts to click a Selenium element using JavaScript execution.
     Retries if the click is intercepted.
     """
     for _ in range(retries):
         try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+            time.sleep(0.2)
             driver.execute_script("arguments[0].click();", element)
             return True
         except ElementClickInterceptedException:

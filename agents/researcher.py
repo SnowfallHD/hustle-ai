@@ -14,6 +14,7 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.keys import Keys
 from dom_utils import safe_click, safe_find, safe_text
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 from openai import OpenAI
 
 # Load environment variables
@@ -141,11 +142,86 @@ def auto_login(driver):
         with open("debug_final_page.html", "w", encoding="utf-8") as f:
             f.write(driver.page_source)
         raise RuntimeError(f"Login flow failed: {e}")
+    
+def wait_for_manual_click(driver, label=""):
+    print(f"\n[DEBUG] === Waiting for MANUAL ACTION: {label} ===")
+    print("[ACTION] Manually click the element now...")
+    input("[INPUT] Press Enter when you’ve clicked it to capture...")
+
+    element = driver.execute_script("return document.activeElement;")
+    tag = element.tag_name
+    text = element.text.strip()
+    class_list = element.get_attribute("class")
+    outer_html = element.get_attribute("outerHTML")
+
+    print(f"\n[DEBUG] Captured element from manual click:")
+    print(f"  ▶ Tag: {tag}")
+    print(f"  ▶ Class: {class_list}")
+    print(f"  ▶ Text: '{text}'")
+    print(f"  ▶ Outer HTML Snippet:\n{outer_html[:300]}...\n")
+
+    return element
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+
+def select_entries_per_page(driver):
+    try:
+        print("[DEBUG] Locating 'Entries per page' label...")
+
+        # Step 1: Wait for the label
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Entries per page')]"))
+        )
+
+        print("[DEBUG] Label found — attempting to locate dropdown button automatically...")
+
+        # Step 2: Try automatic dropdown click
+        try:
+            dropdown_elem = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@data-test='select-trigger']"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", dropdown_elem)
+            time.sleep(0.2)
+            dropdown_elem.click()
+            print("[INFO] Clicked dropdown automatically.")
+        except Exception:
+            print("[WARN] Automatic dropdown click failed — switching to manual mode.")
+            dropdown_elem = wait_for_manual_click(driver, "Click the dropdown now")
+            driver.execute_script("arguments[0].scrollIntoView(true);", dropdown_elem)
+            time.sleep(0.3)
+            if not safe_click(driver, dropdown_elem):
+                raise Exception("Manual dropdown click failed.")
+
+        # Step 3: Attempt to auto-select "100"
+        try:
+            hundred_option = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, "//span[normalize-space(text())='100']"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", hundred_option)
+            time.sleep(0.2)
+            hundred_option.click()
+            print("[INFO] Clicked '100' automatically.")
+        except Exception:
+            print("[WARN] Automatic click on '100' failed — switching to manual mode.")
+            hundred_elem = wait_for_manual_click(driver, "Now click the '100' option and then press ENTER here")
+            driver.execute_script("arguments[0].scrollIntoView(true);", hundred_elem)
+            time.sleep(0.3)
+            if not safe_click(driver, hundred_elem):
+                raise Exception("Clicking '100' failed.")
+
+        print("[SUCCESS] '100 entries per page' selected successfully.")
+        time.sleep(3)
+
+    except Exception as e:
+        print(f"[ERROR] Failed to set 100 entries per page: {e}")
 
 def scrape_digistore_offers():
     print("[DEBUG] Starting scrape_digistore_offers()")
     print(f"[DEBUG] IS_DEV = {IS_DEV} (type: {type(IS_DEV)})")
-    
+
     driver = start_driver()
     print("[DEBUG] Driver started")
 
@@ -156,23 +232,75 @@ def scrape_digistore_offers():
         driver.get("https://www.digistore24-app.com/app/en/vendor/account/marketplace/all")
         print("[DEBUG] Navigated to Digistore24 marketplace")
 
-        time.sleep(3)
+        time.sleep(2)
 
+        # === Set to 100 entries per page ===
         try:
-            WebDriverWait(driver, 35).until(
+            print("[DEBUG] Locating 'Entries per page' label...")
+
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Entries per page')]"))
+            )
+
+            print("[DEBUG] Found label — attempting auto-click on dropdown...")
+
+            try:
+                print("[DEBUG] Locating the dropdown near 'Entries per page'...")
+
+                # Find the label first
+                label_elem = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Entries per page')]"))
+                )
+
+                # Move up to the parent container and find the dropdown button inside
+                parent_container = label_elem.find_element(By.XPATH, "./ancestor::div[contains(@class, 'flex')][1]")
+                dropdown_btn = parent_container.find_element(By.XPATH, ".//button[contains(@class, 'min-h-[40px')]")
+
+                driver.execute_script("arguments[0].scrollIntoView(true);", dropdown_btn)
+                time.sleep(0.3)
+                dropdown_btn.click()
+                print("[INFO] Clicked the correct 'Entries per page' dropdown.")
+            except Exception as e:
+                print(f"[WARN] Auto dropdown click failed — switching to manual: {e}")
+                dropdown_btn = wait_for_manual_click(driver, "Click the correct Entries dropdown (NOT currency)")
+                driver.execute_script("arguments[0].scrollIntoView(true);", dropdown_btn)
+                safe_click(driver, dropdown_btn)
+
+            # Try auto-clicking "100"
+            try:
+                opt_100 = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, "//span[normalize-space(text())='100']"))
+                )
+                driver.execute_script("arguments[0].scrollIntoView(true);", opt_100)
+                opt_100.click()
+                print("[INFO] Clicked '100' automatically.")
+            except Exception:
+                print("[WARN] Auto click on '100' failed — switching to manual.")
+                opt_100 = wait_for_manual_click(driver, "Click the '100' entries option now")
+                driver.execute_script("arguments[0].scrollIntoView(true);", opt_100)
+                time.sleep(0.2)
+                safe_click(driver, opt_100)
+
+            print("[SUCCESS] Set 100 entries per page")
+            time.sleep(3)
+
+        except Exception as e:
+            print(f"[ERROR] Failed to set 100 entries per page: {e}")
+
+        # === Load offers ===
+        try:
+            WebDriverWait(driver, 15).until(
                 EC.presence_of_all_elements_located((By.CLASS_NAME, "product-list-item-container"))
             )
             print("[DEBUG] Offer cards loaded")
         except Exception as e:
             driver.save_screenshot("debug_login_failed.png")
-            print(f"[ERROR] Failed to load offers: {e}")
             raise RuntimeError("Failed to load offers — likely not logged in.") from e
 
         offer_cards = driver.find_elements(By.CLASS_NAME, "product-list-item-container")
         print(f"[DEBUG] Found {len(offer_cards)} Digistore24 offers")
 
         offers = []
-        parsed = 0
         for idx, card in enumerate(offer_cards):
             print(f"[DEBUG] Parsing offer card {idx + 1}")
             expand_btn = safe_find(card, By.CSS_SELECTOR, ".arrow-down-icon.cursor-pointer", timeout=2)
@@ -185,9 +313,7 @@ def scrape_digistore_offers():
                 time.sleep(0.5)
 
                 raw_name = safe_text(card, By.TAG_NAME, "h2")
-                print(f"[DEBUG] Raw name: {raw_name}")
                 name = clean_title(raw_name)
-                print(f"[DEBUG] Cleaned name: {name}")
 
                 earnings_text = safe_text(card, By.XPATH, ".//div[contains(text(), 'Earnings/cart visitor')]/following-sibling::div[1]")
                 price = safe_text(card, By.XPATH, ".//div[contains(text(), 'Price')]/following-sibling::div[1]")
@@ -195,7 +321,7 @@ def scrape_digistore_offers():
                 cart_conversion = safe_text(card, By.XPATH, ".//div[contains(text(), 'Cart conversion')]/following-sibling::div[1]")
                 cancel_rate = safe_text(card, By.XPATH, ".//div[contains(text(), 'Cancellation rate')]/following-sibling::div[1]")
                 vendor = safe_text(card, By.XPATH, ".//div[contains(text(), 'Vendor')]/following-sibling::div[1]")
-                # Pull full description block
+
                 try:
                     raw_description = safe_text(card, By.XPATH, ".//div[contains(@class, 'description')]")
                     description = clean_description(raw_description)
@@ -221,14 +347,12 @@ def scrape_digistore_offers():
                     "description": description
                 })
 
-                parsed += 1
                 print(f"[DEBUG] Parsed card {idx + 1}")
-                if parsed >= 10:
-                    print("[DEBUG] Reached max parse limit (10)")
-                    break
 
             except Exception as e:
-                print(f"[WARN] Failed to parse expanded card {idx + 1}: {e}")
+                print(f"[WARN] Failed to parse card {idx + 1}: {e}")
+
+        return offers
 
     finally:
         print("[DEBUG] Entering finally block...")
@@ -241,9 +365,6 @@ def scrape_digistore_offers():
                 print(f"[ERROR] Failed to quit driver: {quit_err}")
         else:
             print("[DEBUG] Skipping driver.quit() because IS_DEV is True")
-
-    print("[DEBUG] Returning offers")
-    return offers
 
 def enrich_with_ai(offers):
     enriched = []
