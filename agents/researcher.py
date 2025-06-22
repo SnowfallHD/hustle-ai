@@ -24,11 +24,13 @@ print(f"[DEBUG] IS_DEV = {IS_DEV} (DEV_MODE={os.getenv('DEV_MODE')})")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Firefox profile
-PROFILE_PATH = r"C:\\Users\\Coop\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\rjpq4cir.selenium-test"
+PROFILE_PATH = os.getenv("PROFILE_PATH")
+FIREFOX_BINARY = os.getenv("FIREFOX_BINARY")
 
 def start_driver():
     options = Options()
     options.headless = False
+    options.binary_location = FIREFOX_BINARY
     options.set_preference("general.useragent.override", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0")
     driver = webdriver.Firefox(service=Service(GeckoDriverManager().install()), options=options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -247,7 +249,7 @@ def scrape_digistore_offers():
                 arguments[0].style.display = 'block';
                 arguments[0].scrollIntoView({block: 'center'});
             """, dropdown_btn)
-            time.sleep(0.3)
+            time.sleep(0.5)
             dropdown_btn.click()
             print("[INFO] Clicked the 'Entries per page' dropdown.")
 
@@ -255,7 +257,7 @@ def scrape_digistore_offers():
                 EC.element_to_be_clickable((By.XPATH, "//span[normalize-space(text())='100']"))
             )
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", opt_100)
-            time.sleep(0.2)
+            time.sleep(0.5)
             opt_100.click()
             print("[SUCCESS] Selected 100 entries per page")
 
