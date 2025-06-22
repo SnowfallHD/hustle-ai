@@ -162,11 +162,6 @@ def wait_for_manual_click(driver, label=""):
 
     return element
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import time
-
 def select_entries_per_page(driver):
     try:
         print("[DEBUG] Locating 'Entries per page' label...")
@@ -237,11 +232,10 @@ def scrape_digistore_offers():
         print("[DEBUG] Navigated to Digistore24 marketplace")
         time.sleep(2)
 
-        # === Set to 100 entries per page ===
+        # === Set 100 entries per page ===
         try:
             print("[DEBUG] Attempting to set 100 entries per page...")
 
-            # Wait for label to be present
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Entries per page')]"))
             )
@@ -249,12 +243,10 @@ def scrape_digistore_offers():
             parent = label_elem.find_element(By.XPATH, "./ancestor::div[contains(@class, 'flex')][1]")
             dropdown_btn = parent.find_element(By.XPATH, ".//button[contains(@class, 'min-h-[40px')]")
 
-            # Force scroll into center AND make visible
             driver.execute_script("""
                 arguments[0].style.display = 'block';
                 arguments[0].scrollIntoView({block: 'center'});
             """, dropdown_btn)
-
             time.sleep(0.3)
             dropdown_btn.click()
             print("[INFO] Clicked the 'Entries per page' dropdown.")
@@ -262,13 +254,11 @@ def scrape_digistore_offers():
             opt_100 = WebDriverWait(driver, 5).until(
                 EC.element_to_be_clickable((By.XPATH, "//span[normalize-space(text())='100']"))
             )
-
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", opt_100)
             time.sleep(0.2)
             opt_100.click()
             print("[SUCCESS] Selected 100 entries per page")
 
-            # Wait until more than 10 cards are visible
             WebDriverWait(driver, 10).until(
                 lambda d: len(d.find_elements(By.CLASS_NAME, "product-list-item-container")) > 10
             )
@@ -276,8 +266,8 @@ def scrape_digistore_offers():
         except Exception as e:
             print(f"[WARN] Could not set 100 entries per page: {e}")
 
-        # === Gather all offer card elements across pages ===
-        all_offer_cards = []
+        offers = []
+        seen_titles = set()
 
         while True:
             WebDriverWait(driver, 15).until(
@@ -285,132 +275,105 @@ def scrape_digistore_offers():
             )
             cards = driver.find_elements(By.CLASS_NAME, "product-list-item-container")
             print(f"[DEBUG] Found {len(cards)} offers on this page")
-            all_offer_cards.extend(cards)
 
-            # === End of pagination guard ===
-            if len(cards) < 100:
-                print("[INFO] Detected last page based on offer count. Exiting pagination loop.")
+            new_titles = set()
+            page_offers = []
+
+            for idx, card in enumerate(cards):
+                try:
+                    raw_name = safe_text(card, By.TAG_NAME, "h2")
+                    if raw_name in seen_titles:
+                        continue  # skip already seen offers
+                    new_titles.add(raw_name)
+
+                    expand_btn = safe_find(card, By.CSS_SELECTOR, ".arrow-down-icon.cursor-pointer", timeout=1)
+                    if expand_btn:
+                        try:
+                            safe_click(driver, expand_btn)
+                            time.sleep(0.2)
+                        except:
+                            print(f"[WARN] Could not click expand for card {idx + 1}")
+
+                    name = clean_title(raw_name)
+                    info_map = {}
+                    info_rows = card.find_elements(By.CLASS_NAME, "info-box")
+                    for row in info_rows:
+                        try:
+                            key_el = row.find_element(By.CLASS_NAME, "font-medium")
+                            val_el = row.find_elements(By.TAG_NAME, "div")[-1]
+                            key = key_el.text.strip()
+                            val = val_el.text.strip()
+                            info_map[key] = val
+                        except:
+                            continue
+
+                    price = info_map.get("Price", "")
+                    commission = info_map.get("Commission", "")
+                    earnings_text = info_map.get("Earnings/cart visitor", "")
+                    cart_conversion = info_map.get("Cart conversion", "")
+                    cancel_rate = info_map.get("Cancellation rate", "")
+                    vendor = info_map.get("Vendor", "")
+
+                    try:
+                        raw_description = safe_text(card, By.XPATH, ".//div[contains(@class, 'description')]")
+                        description = clean_description(raw_description)
+                    except:
+                        description = "No description available"
+
+                    url = ""
+                    for link in card.find_elements(By.TAG_NAME, "a"):
+                        if "Sales page" in link.text:
+                            url = link.get_attribute("href")
+                            break
+
+                    offer_data = {
+                        "name": name,
+                        "raw_name": raw_name,
+                        "price": price,
+                        "commission": commission,
+                        "earnings_per_cart_visitor": earnings_text,
+                        "cart_conversion": cart_conversion,
+                        "cancellation_rate": cancel_rate,
+                        "vendor": vendor,
+                        "url": url,
+                        "description": description
+                    }
+
+                    offers.append(offer_data)
+                    page_offers.append(offer_data)
+
+                except Exception as e:
+                    print(f"[WARN] Failed to parse card {idx + 1}: {e}")
+
+            if not new_titles or new_titles.issubset(seen_titles):
+                print("[INFO] No new offers found — ending pagination.")
                 break
+            seen_titles.update(new_titles)
 
-            # Try to click next page automatically
+            # Try clicking "Next"
             try:
                 print("[DEBUG] Attempting to click 'Next' pagination arrow automatically...")
-
                 all_page_links = WebDriverWait(driver, 3).until(
                     EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.page-link[href*='?page=']"))
                 )
-                
                 if not all_page_links:
                     raise Exception("No page-link elements found.")
-
-                next_btn = all_page_links[-1]  # usually the last one is 'Next'
-                
+                next_btn = all_page_links[-1]
                 if "disabled" in next_btn.get_attribute("class") or not next_btn.get_attribute("href"):
                     print("[INFO] Next button is disabled — reached last page.")
                     break
-
                 driver.execute_script("arguments[0].scrollIntoView(true);", next_btn)
+                time.sleep(0.2)
                 safe_click(driver, next_btn)
-                print("[INFO] Clicked 'Next' pagination button.")
-
-                # Wait for the page to update
-                WebDriverWait(driver, 10).until(
-                    EC.staleness_of(cards[0])
-                )
-
-                # Wait for new cards to load
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_all_elements_located((By.CLASS_NAME, "product-list-item-container"))
-                )
+                WebDriverWait(driver, 10).until(EC.staleness_of(cards[0]))
             except Exception as e:
-                print(f"[WARN] Could not click next page automatically: {e}")
-                print("[DEBUG] Waiting for manual click on pagination arrow...")
+                print(f"[WARN] Pagination error: {e}")
+                break
 
-                # === Manual Click Handling ===
-                try:
-                    next_btn = wait_for_manual_click(driver, "Click the NEXT arrow now and then press ENTER")
-                    driver.execute_script("arguments[0].scrollIntoView(true);", next_btn)
-                    time.sleep(0.2) # Wait for scroll to settle
-                    safe_click(driver, next_btn)
-                    time.sleep(1) # Wait for the page to update
-                except Exception as ex:
-                    print(f"[DEBUG] No more pages or manual next click skipped: {ex}")
-                    break
 
-        print(f"[DEBUG] Total offers collected: {len(all_offer_cards)}")
-
-        # === Parse all offers ===
-        offers = []
-        for idx, card in enumerate(all_offer_cards):
-            print(f"[DEBUG] Parsing offer card {idx + 1}")
-
-            try:
-                # Optional: expand only if needed — test if expand actually reveals hidden info
-                expand_btn = safe_find(card, By.CSS_SELECTOR, ".arrow-down-icon.cursor-pointer", timeout=1)
-                if expand_btn:
-                    try:
-                        safe_click(driver, expand_btn)
-                        time.sleep(0.2)  # minimal delay if needed
-                    except:
-                        print(f"[WARN] Could not click expand for card {idx + 1}")
-
-                raw_name = safe_text(card, By.TAG_NAME, "h2")
-                name = clean_title(raw_name)
-
-                # === Batch info field extraction ===
-                info_map = {}
-                info_rows = card.find_elements(By.CLASS_NAME, "info-box")
-                for row in info_rows:
-                    try:
-                        key_el = row.find_element(By.CLASS_NAME, "font-medium")
-                        val_el = row.find_elements(By.TAG_NAME, "div")[-1]
-                        key = key_el.text.strip()
-                        val = val_el.text.strip()
-                        info_map[key] = val
-                    except Exception:
-                        continue
-
-                price = info_map.get("Price", "")
-                commission = info_map.get("Commission", "")
-                earnings_text = info_map.get("Earnings/cart visitor", "")
-                cart_conversion = info_map.get("Cart conversion", "")
-                cancel_rate = info_map.get("Cancellation rate", "")
-                vendor = info_map.get("Vendor", "")
-
-                # === Optional description extraction ===
-                try:
-                    raw_description = safe_text(card, By.XPATH, ".//div[contains(@class, 'description')]")
-                    description = clean_description(raw_description)
-                except Exception:
-                    description = "No description available"
-
-                # === Extract sales page URL ===
-                url = ""
-                for link in card.find_elements(By.TAG_NAME, "a"):
-                    if "Sales page" in link.text:
-                        url = link.get_attribute("href")
-                        break
-
-                offers.append({
-                    "name": name,
-                    "raw_name": raw_name,
-                    "price": price,
-                    "commission": commission,
-                    "earnings_per_cart_visitor": earnings_text,
-                    "cart_conversion": cart_conversion,
-                    "cancellation_rate": cancel_rate,
-                    "vendor": vendor,
-                    "url": url,
-                    "description": description
-                })
-
-                print(f"[DEBUG] Parsed card {idx + 1}")
-
-            except Exception as e:
-                print(f"[WARN] Failed to parse card {idx + 1}: {e}")
-
+        print(f"[DEBUG] Total offers collected: {len(offers)}")
         return offers
-        
+
     finally:
         print("[DEBUG] Entering finally block...")
         if not IS_DEV:
