@@ -15,6 +15,7 @@ from selenium.webdriver.common.keys import Keys
 from dom_utils import safe_click, safe_find, safe_text
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import StaleElementReferenceException
 from openai import OpenAI
 
 # Load environment variables
@@ -352,26 +353,64 @@ def scrape_digistore_offers():
                 break
             seen_titles.update(new_titles)
 
-            # Try clicking "Next"
+            # === Ensure pagination controls are visible before entering the loop ===
             try:
-                print("[DEBUG] Attempting to click 'Next' pagination arrow automatically...")
-                all_page_links = WebDriverWait(driver, 3).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.page-link[href*='?page=']"))
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "a.page-link[href*='?page=']"))
                 )
-                if not all_page_links:
-                    raise Exception("No page-link elements found.")
-                next_btn = all_page_links[-1]
-                if "disabled" in next_btn.get_attribute("class") or not next_btn.get_attribute("href"):
-                    print("[INFO] Next button is disabled — reached last page.")
-                    break
-                driver.execute_script("arguments[0].scrollIntoView(true);", next_btn)
-                time.sleep(0.2)
-                safe_click(driver, next_btn)
-                WebDriverWait(driver, 10).until(EC.staleness_of(cards[0]))
-            except Exception as e:
-                print(f"[WARN] Pagination error: {e}")
-                break
+                print("[DEBUG] Pagination controls detected — beginning pagination loop.")
+            except TimeoutException:
+                print("[WARN] Pagination controls did not appear. Exiting early.")
+                return offers
 
+            # === Begin pagination loop ===
+            try:
+                cards = driver.find_elements(By.CLASS_NAME, "product-list-item-container")
+                if not cards:
+                    print("[WARN] No cards found on initial page — exiting.")
+                    break
+
+                print(f"[DEBUG] Found {len(cards)} offers on this page.")
+                reference_card = cards[0]
+
+                if(len(cards) < 100):
+                    print("[INFO] Page has less than 100 products -- reached last page.")
+                    break
+
+                # Find 'Next' pagination button
+                page_links = driver.find_elements(By.CSS_SELECTOR, "a.page-link[href*='?page=']")
+                if not page_links:
+                    print("[INFO] No pagination links found — assuming last page.")
+                    break
+
+                next_btn = page_links[-1]
+
+                # Scroll + Click with retry
+                driver.execute_script("arguments[0].scrollIntoView(true);", next_btn)
+                time.sleep(0.3)
+
+                for _ in range(2):
+                    try:
+                        safe_click(driver, next_btn)
+                        break
+                    except StaleElementReferenceException:
+                        print("[WARN] Stale next_btn — refetching...")
+                        page_links = driver.find_elements(By.CSS_SELECTOR, "a.page-link[href*='?page=']")
+                        next_btn = page_links[-1]
+
+                # Wait for page to change based on card staleness
+                WebDriverWait(driver, 10).until(EC.staleness_of(reference_card))
+
+                # Wait for cards to reappear
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_all_elements_located((By.CLASS_NAME, "product-list-item-container"))
+                )
+
+                time.sleep(1.0)  # optional: let it settle visually
+
+            except Exception as e:
+                print(f"[ERROR] Pagination loop failed: {e}")
+                break
 
         print(f"[DEBUG] Total offers collected: {len(offers)}")
         return offers
@@ -424,9 +463,24 @@ def enrich_with_ai(offers):
             continue
 
         try:
-            enriched.append(json.loads(enriched_offer))
+            parsed = json.loads(enriched_offer)
+
+            # Normalize keys for Builder
+            idea = {
+                "name": offer["name"],
+                "hook": parsed.get("Main hook") or parsed.get("hook") or "N/A",
+                "platform": parsed.get("Ideal traffic source") or parsed.get("platform") or "N/A",
+                "content": parsed.get("Type of content") or parsed.get("content") or "N/A",
+                # Optional metadata
+                "difficulty": parsed.get("Monetization difficulty"),
+                "roi": parsed.get("Expected ROI")
+            }
+
+            enriched.append(idea)
+
         except json.JSONDecodeError as e:
             print(f"[ERROR] Failed to parse AI response:\n{enriched_offer}\n{e}")
+
 
     return enriched
 
