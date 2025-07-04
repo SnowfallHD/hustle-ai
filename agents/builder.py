@@ -7,54 +7,45 @@ from hashlib import sha256
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+IS_DEV = os.getenv("DEV_MODE") == "1"
 
-IS_DEV = os.getenv("DEV_MODE") == "1"  # Only processes 1 idea when True
+IDEAS_PATH = "memory/ideas.json"
+OUTPUTS_PATH = "memory/outputs.json"
 
-# Keep track of already-built ideas using hash of name+hook
 def already_processed_hashes():
     hashes = set()
-    path = "memory/ideas_enriched.json"
-    if not os.path.exists(path):
+    if not os.path.exists(OUTPUTS_PATH):
         return hashes
-    with open(path, "r", encoding="utf-8") as f:
+    with open(OUTPUTS_PATH, "r", encoding="utf-8") as f:
         for line in f:
             try:
-                enriched = json.loads(line)
-                h = sha256((enriched.get("name", "") + enriched.get("hook", "")).encode()).hexdigest()
+                data = json.loads(line)
+                h = sha256((data.get("name", "") + data.get("hook", "")).encode()).hexdigest()
                 hashes.add(h)
             except:
                 continue
     return hashes
 
 def load_ideas():
-    with open("memory/ideas.json", "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    if not os.path.exists(IDEAS_PATH):
+        return []
+    with open(IDEAS_PATH, "r", encoding="utf-8") as f:
+        return [json.loads(line.strip()) for line in f if line.strip()]
 
-    ideas = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ideas.append(json.loads(line))
-        except json.JSONDecodeError as e:
-            print(f"[WARN] Skipping bad idea line:\n{line}\n{e}")
-
-    return ideas
+def save_remaining_ideas(remaining):
+    with open(IDEAS_PATH, "w", encoding="utf-8") as f:
+        for idea in remaining:
+            f.write(json.dumps(idea) + "\n")
 
 def extract_json_from_response(text):
     match = re.search(r"\{[\s\S]+\}", text)
     if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] JSON parsing failed: {e}")
-            raise
-    raise ValueError("No valid JSON found in GPT response.")
+        return json.loads(match.group(0))
+    raise ValueError("No valid JSON object found in response.")
 
 def build_assets(idea):
     prompt = f"""
-            You are the Builder Agent for HustleAI. Here's an idea you received:
+            You are the Builder Agent for HustleAI. Here's an idea:
 
             Offer Name: {idea.get('name', 'N/A')}
             Hook: {idea.get('hook', 'N/A')}
@@ -66,7 +57,7 @@ def build_assets(idea):
             2. ad_hooks: list of short-form ad scripts
             3. sales_email: one-paragraph sales email (as a string)
 
-            Return ONLY the JSON object. Do not explain anything else.
+            Return ONLY the JSON object.
             """
 
     try:
@@ -79,40 +70,47 @@ def build_assets(idea):
             temperature=0.7
         )
 
-        print("[DEBUG] Raw GPT output:")
-        print(response.choices[0].message.content)
+        content = response.choices[0].message.content.strip()
+        print("[DEBUG] GPT Output:", content[:200], "...\n")
+        parsed = extract_json_from_response(content)
 
-        outputs = extract_json_from_response(response.choices[0].message.content)
-        idea["assets"] = outputs
+        idea["assets"] = parsed
+        with open(OUTPUTS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(idea) + "\n")
 
-        with open("memory/ideas_enriched.json", "a", encoding="utf-8") as f:
-            json.dump(idea, f)
-            f.write("\n")
-
-        return outputs
+        print(f"[SUCCESS] Built and saved assets for: {idea['name']}")
+        return True
 
     except Exception as e:
-        print(f"[ERROR] GPT generation failed for idea: {idea.get('name')} — {e}")
-        return None
+        print(f"[ERROR] Failed to build assets for {idea.get('name', 'Unknown')}: {e}")
+        return False
 
 def run_build():
-    ideas = load_ideas()
+    all_ideas = load_ideas()
     seen_hashes = already_processed_hashes()
-    built_count = 0
 
-    for idea in ideas:
+    remaining_ideas = []
+    processed_count = 0
+
+    for idea in all_ideas:
         h = sha256((idea.get("name", "") + idea.get("hook", "")).encode()).hexdigest()
         if h in seen_hashes:
-            print(f"[INFO] Skipping already built idea: {idea.get('name')}")
+            print(f"[SKIP] Already processed: {idea['name']}")
             continue
 
-        print(f"[INFO] Building assets for: {idea.get('name')}")
-        build_assets(idea)
-        built_count += 1
+        print(f"[BUILDING] {idea['name']}")
+        success = build_assets(idea)
+        if success:
+            processed_count += 1
+        else:
+            remaining_ideas.append(idea)  # Retry next run
 
-        if IS_DEV and built_count >= 1:
-            print("[DEBUG] DEV mode active — stopping after 1 idea.")
+        if IS_DEV and processed_count >= 1:
+            print("[DEBUG] DEV_MODE active — stopping after 1 idea.")
             break
+
+    save_remaining_ideas(remaining_ideas)
+    print(f"\n✅ Build complete. {processed_count} new idea(s) processed. {len(remaining_ideas)} remaining.")
 
 if __name__ == "__main__":
     run_build()
