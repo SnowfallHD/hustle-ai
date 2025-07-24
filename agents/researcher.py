@@ -1,248 +1,348 @@
 import os
-import json
-import time
-import re
-import unicodedata
 from dotenv import load_dotenv
-from openai import OpenAI
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
+from enricher import enrich_offers
+from ai_locator import get_selector, analyze_site, get_affiliate_fields, get_selectors_from_strategy, html_looks_valid
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-IS_DEV = os.getenv("DEV_MODE") == "1"
 
-def clean_description(text):
-    if not text:
-        return ""
-    text = unicodedata.normalize("NFKD", text)
-    text = re.sub(r'https?://\S+|www\.\S+', '', text)
-    text = re.sub(r'\S+@\S+', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = text.encode('ascii', 'ignore').decode()
-    return text.strip()
+# 🔗 Target site (set dynamically)
+TARGET_URL = "https://www.digistore24.com/"
 
-def clean_title(raw_title):
-    prompt = f"""
-    Clean up this product name: "{raw_title}"
-    Remove hype, marketing fluff, and special characters. Output only the cleaned title.
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4-1106-preview",
-            messages=[
-                {"role": "system", "content": "You are a product naming expert."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return raw_title
+# Site information
+has_login: bool
+site_type: str
 
-def handle_cookie_popup(page):
-    try:
-        page.wait_for_selector("#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", timeout=5000)
-        page.click("#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll")
-        print("[INFO] Cookiebot accepted.")
-    except:
-        print("[INFO] No Cookiebot popup.")
+# 🔐 Credentials (from .env)
+DIGISTORE_EMAIL = os.getenv("DIGISTORE_EMAIL")
+DIGISTORE_PASSWORD = os.getenv("DIGISTORE_PASSWORD")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-def login(page):
-    print("[DEBUG] Navigating to login page...")
-    page.goto("https://www.digistore24.com/login", timeout=60000)
-    handle_cookie_popup(page)
-    time.sleep(1.5)
+if not all([DIGISTORE_EMAIL, DIGISTORE_PASSWORD, OPENAI_API_KEY]):
+    raise EnvironmentError("Missing required environment variables in .env")
 
-    try:
-        print("[DEBUG] Injecting credentials through shadow DOM...")
 
-        email = json.dumps(os.getenv("DIGISTORE_EMAIL"))
-        password = json.dumps(os.getenv("DIGISTORE_PASSWORD"))
-        if not email or not password:
-            raise ValueError("Missing DIGISTORE_EMAIL or DIGISTORE_PASSWORD in .env!")
+# Helper: Fill login form dynamically
+async def login_if_needed(page, html):
+    # Step 1: Analyze whether login is needed
+    analysis = await analyze_site(html)
 
-        # JS trick to inject into shadow DOM inputs
-        page.evaluate(f'''
-            () => {{
-                const emailInput = document.querySelector("input[type='email']");
-                const passInput = document.querySelector("input[type='password']");
-                if (emailInput) emailInput.value = {email};
-                if (passInput) passInput.value = {password};
-            }}
-        ''')
+    if not analysis.get("has_login"):
+        print("🔓 No login required.")
+        return
 
-        print("[DEBUG] Submitting login form...")
-        # Submit login form
-        # Wait for the Login button using a visual fallback
-        page.wait_for_selector("button", timeout=10000)
-        buttons = page.query_selector_all("button")
+    print("🔐 Login required. Attempting login...")
 
-        for button in buttons:
-            if "login" in button.inner_text().lower():
-                button.click()
+    # Step 2: Try clicking login link/button if present
+    login_link_selector = await get_selector(html, "Login link or button in the top navigation")
+    if login_link_selector:
+        try:
+            await page.click(login_link_selector)
+            await page.wait_for_timeout(1500)  # allow modal or redirect to load
+            html = await page.content()  # refresh HTML after login UI is visible
+        except Exception as e:
+            print(f"⚠️ Failed to click login link: {e}")
+
+    # Step 3: Detect iframe if applicable
+    iframe_selector = await get_selector(html, "Iframe containing the login form (if any)")
+    if iframe_selector:
+        try:
+            frame_element = await page.query_selector(iframe_selector)
+            frame = await frame_element.content_frame()
+            email_selector = await get_selector(await frame.content(), "Email input field for login")
+            password_selector = await get_selector(await frame.content(), "Password input field for login")
+            submit_selector = await get_selector(await frame.content(), "Login button to submit the form")
+            await frame.fill(email_selector, DIGISTORE_EMAIL)
+            await frame.fill(password_selector, DIGISTORE_PASSWORD)
+            await frame.click(submit_selector)
+        except Exception as e:
+            print(f"⚠️ Failed to login inside iframe: {e}")
+            return
+    else:
+        # Step 4: Direct login form on page
+        email_selector = await get_selector(html, "Email input field for login")
+        password_selector = await get_selector(html, "Password input field for login")
+        submit_selector = await get_selector(html, "Login button to submit the form")
+        try:
+            await page.fill(email_selector, DIGISTORE_EMAIL)
+            await page.fill(password_selector, DIGISTORE_PASSWORD)
+            await page.click(submit_selector)
+        except Exception as e:
+            print(f"⚠️ Failed to login on main page: {e}")
+            return
+
+    # Step 5: Wait for login to complete
+    await page.wait_for_load_state("networkidle")
+    print("✅ Logged in successfully.")
+
+# Helper: Navigate to marketplace or main scrape zone using pre-processed site_info
+async def navigate_to_target_area(page, site_info):
+    catalog_url = site_info.get("catalog_url")
+    if not catalog_url:
+        print("🛑 No catalog_url found in site_info.")
+        return None
+
+    print(f"🛒 Navigating to catalog: {catalog_url}")
+    await page.goto(catalog_url)
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1000)
+
+    return site_info
+
+async def scrape(page, site_info, selectors):
+    site_type = site_info.get("site_type", "unknown")
+
+    if site_type == "affiliate":
+        return await scrape_affiliate_cards(page, site_info, selectors)
+    else:
+        return await scrape_general_site(page, selectors)
+
+async def scrape_affiliate_cards(page, site_info, selectors):
+    offers = []
+
+    # Handle dropdown to increase items per page
+    if site_info.get("has_page_size_dropdown"):
+        try:
+            await page.click(site_info["page_size_dropdown_selector"])
+            await page.click(site_info["max_items_option_selector"])
+            await page.wait_for_timeout(2000)
+            print("✅ Maximized items per page.")
+        except:
+            print("⚠️ Pagination optimization failed.")
+
+    page_number = 1
+    while True:
+        print(f"📄 Scraping page {page_number}...")
+
+        content_selector = selectors.get("product_card_selector")
+        if not content_selector:
+            print("⚠️ No product_card_selector returned.")
+            break
+
+        content_elements = await page.query_selector_all(content_selector)
+        print(f"🔍 Found {len(content_elements)} product cards.")
+
+        for element in content_elements:
+            el_html = await element.inner_html()
+            item_data = {}
+
+            # Optional: Handle detail view expansion if needed
+            if site_info.get("product_detail_selector"):
+                try:
+                    detail = await element.query_selector(site_info["product_detail_selector"])
+                    if detail:
+                        await detail.click()
+                        await page.wait_for_timeout(1000)
+                except:
+                    print("⚠️ Could not expand detail view.")
+
+            # AI-based field extraction
+            field_list = await get_affiliate_fields(el_html)
+            for field in field_list:
+                sel = await get_selector(el_html, field)
+                if sel:
+                    el = await element.query_selector(sel)
+                    if el:
+                        text = await el.inner_text() if "link" not in field.lower() else await el.get_attribute("href")
+                        item_data[field.lower().replace(" ", "_")] = text.strip() if text else ""
+
+            # Handle promotion link
+            promo_link = ""
+            if site_info.get("promote_button_selector") and site_info.get("promotion_link_selector"):
+                try:
+                    btn = await element.query_selector(site_info["promote_button_selector"])
+                    if btn:
+                        await btn.click()
+                        await page.wait_for_timeout(2000)
+                        link_el = await page.query_selector(site_info["promotion_link_selector"])
+                        if link_el:
+                            promo_link = await link_el.get_attribute("value")
+                except:
+                    print("⚠️ Failed to extract promotion link.")
+            item_data["promotion_link"] = promo_link
+            offers.append(item_data)
+
+        # 🔄 Check for "Next" page
+        next_selector = await get_selector(await page.content(), "Next page button")
+        if next_selector:
+            try:
+                print("➡️ Found pagination button. Moving to next page...")
+                await page.click(next_selector)
+                await page.wait_for_timeout(2000)
+                page_number += 1
+            except Exception as e:
+                print(f"⚠️ Pagination failed: {e}")
                 break
         else:
-            raise RuntimeError("Login button not found.")
-
-        page.wait_for_load_state("networkidle", timeout=15000)
-
-        page.wait_for_load_state("networkidle", timeout=15000)
-
-        if "login" in page.url.lower():
-            page.screenshot(path="debug_login_failed.png")
-            raise RuntimeError("Login failed — still on login page.")
-
-        print("[✅] Login successful.")
-
-    except Exception as e:
-        page.screenshot(path="debug_final_page.png")
-        raise RuntimeError(f"[ERROR] Login failed: {e}")
-
-def set_100_per_page(page):
-    page.goto("https://www.digistore24-app.com/app/en/vendor/account/marketplace/all", timeout=60000)
-    handle_cookie_popup(page)
-
-    page.wait_for_selector("text=Entries per page", timeout=10000)
-    page.click("button[data-test='select-trigger']")
-    page.click("text=100")
-    page.wait_for_timeout(2000)
-
-def scrape_all_offers(page):
-    offers = []
-    seen_names = set()
-
-    while True:
-        try:
-            page.wait_for_selector(".product-list-item-container", timeout=10000)
-        except PlaywrightTimeout:
-            print("[WARN] No product cards found — skipping page.")
+            print("🛑 No more pages detected.")
             break
-
-        cards = page.query_selector_all(".product-list-item-container")
-        print(f"[+] Found {len(cards)} offers")
-
-        for card in cards:
-            try:
-                name_raw = card.query_selector("h2").inner_text().strip()
-                if name_raw in seen_names:
-                    continue
-                seen_names.add(name_raw)
-                name = clean_title(name_raw)
-
-                info = {}
-                for row in card.query_selector_all(".info-box"):
-                    try:
-                        k = row.query_selector(".font-medium").inner_text().strip()
-                        v = row.query_selector_all("div")[-1].inner_text().strip()
-                        info[k] = v
-                    except:
-                        continue
-
-                desc_elem = card.query_selector("div.description")
-                description_text = clean_description(desc_elem.inner_text()) if desc_elem else "N/A"
-
-                sales_link = ""
-                for link in card.query_selector_all("a"):
-                    if "Sales page" in link.inner_text():
-                        sales_link = link.get_attribute("href")
-                        break
-
-                offers.append({
-                    "name": name,
-                    "raw_name": name_raw,
-                    "price": info.get("Price", ""),
-                    "commission": info.get("Commission", ""),
-                    "earnings_per_cart_visitor": info.get("Earnings/cart visitor", ""),
-                    "cart_conversion": info.get("Cart conversion", ""),
-                    "cancellation_rate": info.get("Cancellation rate", ""),
-                    "vendor": info.get("Vendor", ""),
-                    "url": sales_link,
-                    "description": description_text
-                })
-
-            except Exception as e:
-                print(f"[WARN] Failed to parse card: {e}")
-                continue
-
-        # Try to paginate
-        next_btn = page.query_selector("a.page-link[href*='?page=']:last-child")
-        if not next_btn or not next_btn.is_visible():
-            print("[INFO] No more pages.")
-            break
-
-        next_btn.scroll_into_view_if_needed()
-        next_btn.click()
-        page.wait_for_timeout(2500)
 
     return offers
 
-def enrich_with_ai(offers):
-    enriched = []
-    for offer in offers:
-        prompt = f"""
-        Name: {offer['name']}
-        Description: {offer['description']}
+async def scrape_general_site(page, selectors):
+    html = await page.content()
+    field_list = await get_selectors_from_strategy(html)
 
-        Return JSON:
-        - Main hook or angle to sell this offer
-        - Ideal traffic source (e.g., TikTok, IG, YT)
-        - Type of content that would convert best
-        - Monetization difficulty (Low/Medium/High)
-        - Expected ROI (Low/Medium/High)
-        """
+    result = {}
 
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4-1106-preview",
-                messages=[
-                    {"role": "system", "content": "You are an AI monetization strategist. Respond in JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7
-            )
-            parsed = json.loads(response.choices[0].message.content.strip())
+    for field in field_list:
+        sel = await get_selector(html, field)
+        if sel:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    # Extract href if it's a link-related field
+                    if "link" in field.lower():
+                        text = await el.get_attribute("href")
+                    else:
+                        text = await el.inner_text()
+                    if text:
+                        result[field.lower().replace(" ", "_")] = text.strip()
+                    else:
+                        print(f"⚠️ No text found for field '{field}' using selector '{sel}'")
+                else:
+                    print(f"⚠️ Element not found for selector: {sel} → field: {field}")
+            except Exception as e:
+                print(f"❌ Error while querying selector {sel}: {e}")
+        else:
+            print(f"⚠️ No selector returned for field: {field}")
 
-            enriched.append({
-                "name": offer["name"],
-                "hook": parsed.get("Main hook", "N/A"),
-                "platform": parsed.get("Ideal traffic source", "N/A"),
-                "content": parsed.get("Type of content", "N/A"),
-                "difficulty": parsed.get("Monetization difficulty", "N/A"),
-                "roi": parsed.get("Expected ROI", "N/A")
-            })
+    return [result] if result else []
 
-        except Exception as e:
-            print(f"[ERROR] Failed to enrich: {offer['name']} — {e}")
-            continue
+async def dismiss_cookie_popup_if_present(page):
+    """
+    Try to dismiss Cookiebot popups by clicking the first visible button inside the modal.
+    """
+    try:
+        modal_selector = "#CybotCookiebotDialog"
+        modal = page.locator(modal_selector)
 
-    return enriched
+        if await modal.is_visible():
+            print("🍪 Cookiebot dialog detected.")
 
-def run_research():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not IS_DEV)
-        context = browser.new_context()
-        page = context.new_page()
+            # Try the common accept button first
+            try:
+                accept_button = modal.locator('button#CybotCookiebotDialogBodyButtonAccept')
+                if await accept_button.is_visible():
+                    print("🍪 Clicking Cookiebot Accept button...")
+                    await accept_button.click()
+                    await page.wait_for_timeout(1000)
+            except:
+                pass  # fallback to generic loop if not present
 
-        try:
-            login(page)
-            set_100_per_page(page)
-            offers = scrape_all_offers(page)
+            # Click the first visible button inside the modal
+            buttons = modal.locator("button")
+            count = await buttons.count()
+            for i in range(count):
+                btn = buttons.nth(i)
+                if await btn.is_visible():
+                    print(f"🍪 Attempting to click button #{i} inside cookie dialog...")
+                    await btn.click()
+                    await page.wait_for_timeout(1000)
+                    break
 
-            if IS_DEV:
-                print("[DEBUG] Returning offers only (DEV_MODE).")
-                return offers
+            # Confirm it's gone
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const el = document.querySelector('#CybotCookiebotDialog');
+                        return !el || el.offsetParent === null;
+                    }""",
+                    timeout=5000
+                )
+                print("✅ Cookie modal fully dismissed.")
+                return True
+            except:
+                print("⚠️ Cookie modal still present after click attempt.")
+                return False
+        else:
+            print("🍪 Cookie dialog not detected.")
+            return False
 
-            enriched = enrich_with_ai(offers)
-            os.makedirs("memory", exist_ok=True)
-            with open("memory/ideas.json", "a", encoding="utf-8") as f:
-                for idea in enriched:
-                    json.dump(idea, f)
-                    f.write("\n")
+    except Exception as e:
+        print(f"⚠️ Error while handling cookie popup: {e}")
+        return False
 
-            print(f"[✅] Enriched {len(enriched)} offers saved.")
-            return enriched
-        finally:
-            browser.close()
+MAX_HTML_ATTEMPTS = 3
+# Main dynamic researcher agent
+async def researcher():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        page = await browser.new_page()
+
+        print(f"🌐 Visiting {TARGET_URL}...")
+        await page.goto(TARGET_URL)
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(1000)
+
+        # Step 1: Handle cookie popup
+        await dismiss_cookie_popup_if_present(page)
+
+        html = None
+        for attempt in range(MAX_HTML_ATTEMPTS):
+            await page.wait_for_timeout(1500 + attempt * 500)
+            html = await page.content()
+
+            if await html_looks_valid(html):
+                print(f"✅ Valid HTML detected on attempt {attempt+1}")
+                break
+            else:
+                print(f"⚠️ Attempt {attempt+1}: HTML still looks invalid... retrying...")
+
+        if not html or not await html_looks_valid(html):
+            print("❌ Failed to retrieve valid HTML after multiple attempts.")
+            await browser.close()
+            return
+
+        # 👇 Continue site analysis with clean HTML
+        site_analysis = await analyze_site(html)
+
+        await page.wait_for_timeout(1000)  # small buffer
+
+        # Step 2: Analyze the site structure
+        html = await page.content()
+        site_analysis = await analyze_site(html)
+        print("🧠 Site Analysis:", site_analysis)
+
+        has_login = site_analysis.get("has_login", False)
+        site_type = site_analysis.get("site_type", "unknown")
+
+        # Step 3: Login if required
+        if has_login:
+            print("🔐 Site requires login. Attempting login...")
+            await login_if_needed(page, html)
+            await page.wait_for_timeout(1500)
+            html = await page.content()  # Refresh HTML after login
+        else:
+            print("✅ No login required.")
+
+        # Step 4: Navigate to marketplace/content area
+        site_info = await navigate_to_target_area(page, site_analysis)
+        if not site_info:
+            print("🛑 Exiting: No scrapeable content detected.")
+            await browser.close()
+            return
+
+        # Step 5: Get selectors after reaching main content
+        html = await page.content()
+        selectors = await get_selectors_from_strategy(html, site_type)
+        if not selectors:
+            print("🛑 Exiting: No selectors returned by GPT.")
+            await browser.close()
+            return
+
+        # Step 6: Scrape content based on site type
+        offers = await scrape(page, site_info, selectors)
+
+        # Step 7: Enrich the scraped offers
+        enriched = enrich_offers(offers)
+        print("✅ Enriched Offers:")
+        for offer in enriched:
+            print(offer)
+
+        await browser.close()
+
 
 if __name__ == "__main__":
-    run_research()
+    import asyncio
+    asyncio.run(researcher())

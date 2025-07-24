@@ -1,0 +1,27 @@
+{
+  "name": "hustle-ai",
+  "version": "1.0.0",
+  "description": "Autonomous AI system that researches trending affiliate offers, enriches them with GPT-4, and generates all necessary ad creatives — fully automating the income-generation pipeline.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SnowfallHD/hustle-ai.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/SnowfallHD/hustle-ai/issues"
+  },
+  "homepage": "https://github.com/SnowfallHD/hustle-ai#readme",
+  "dependencies": {
+    "axios": "^1.10.0",
+    "dotenv": "^17.2.0",
+    "puppeteer": "^24.14.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
